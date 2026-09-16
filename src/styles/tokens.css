@@ -1,0 +1,40 @@
+/*
+ * 设计令牌:浅色为基准值(oklch),深色按同一色相体系推导补齐。
+ */
+:root {
+  --bg: oklch(98.5% 0.004 240);
+  --surface: oklch(100% 0 0);
+  --fg: oklch(18% 0.012 250);
+  --muted: oklch(54% 0.012 250);
+  --border: oklch(91.5% 0.006 250);
+  --accent: oklch(58% 0.18 255);
+  --accent-soft: color-mix(in oklch, var(--accent) 12%, transparent);
+  --fg-soft: color-mix(in oklch, var(--fg) 5%, transparent);
+  --ok: oklch(62% 0.16 148);
+  --warn: oklch(72% 0.15 82);
+  --danger: oklch(58% 0.19 25);
+
+  --font-display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+  --font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* 尺寸 */
+  --radius: 10px;
+  --rail: 320px;          /* 侧栏宽度 */
+  --chat-w: 880px;        /* 对话列宽度(可拖拽,480–1400) */
+  --titlebar-h: 48px;
+  --statusbar-h: 30px;
+}
+
+/* 深色模式:由 useAppTheme 在 <html data-theme="dark"> 上切换 */
+:root[data-theme='dark'] {
+  --bg: oklch(19% 0.012 250);
+  --surface: oklch(24% 0.012 250);
+  --fg: oklch(95% 0.006 250);
+  --muted: oklch(66% 0.010 250);
+  --border: oklch(32% 0.010 250);
+  --accent: oklch(68% 0.16 255);
+  --ok: oklch(70% 0.15 148);
+  --warn: oklch(78% 0.14 82);
+  --danger: oklch(66% 0.18 25);
+}

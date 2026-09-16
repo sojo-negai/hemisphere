@@ -1,6 +1,4 @@
 // 连接与会话状态:纯 ref/reactive,不引状态库。
-// 组合式 API 的响应性本身就是状态方案——把 ref 导出即全局 store;
-// 等状态复杂度上来再考虑 Pinia(迁移是机械劳动,不必提前架构)。
 
 import { ref, reactive } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -37,6 +35,9 @@ export const streaming = ref(false)
 /** 当前活动会话 id(session.create 之后回填) */
 export const sessionId = ref('')
 
+/** 后端连接信息(端口/令牌/WS 地址),连接成功后回填,供状态栏与会话详情展示 */
+export const backendInfo = ref<BackendInfo | null>(null)
+
 export const gateway = new GatewayClient()
 
 /** 清空会话流(新对话时用) */
@@ -58,6 +59,7 @@ export async function startAndConnect(): Promise<void> {
   errorMessage.value = ''
   try {
     const info = await invoke<BackendInfo>('start_backend')
+    backendInfo.value = info
 
     gateway.onState((s: ConnectionState) => {
       connected.value = s === 'open'
@@ -79,6 +81,33 @@ export async function startAndConnect(): Promise<void> {
 }
 
 /** 订阅全部网关事件(组件 onMounted 时挂上) */
+/**
+ * 浏览器内预览开关(?preview=1)。
+ * Tauri 之外无法调用 Rust 的 start_backend,做界面时用假连接状态渲染主界面;
+ * 仅在开发构建生效(import.meta.env.DEV),生产包中该分支会被摇树移除。
+ */
+if (import.meta.env.DEV && new URLSearchParams(location.search).has('preview')) {
+  const port = 51234
+  backendInfo.value = {
+    port,
+    token: 'preview-token',
+    ws_url: `ws://127.0.0.1:${port}/api/ws?token=preview-token`,
+  }
+  sessionId.value = 'preview_session_0001'
+  connected.value = true
+  phase.value = 'connected'
+  // 示例消息:让消息流样式可在浏览器里审阅
+  items.push(
+    { kind: 'user', text: '帮我梳理一下新客户端的信息架构。' },
+    {
+      kind: 'assistant',
+      text: '按「外壳常驻、视图切换」来分层：标题栏与侧栏属于外壳，对话 / 能力 / 任务三个视图在主区切换。会话列表按项目或平台分组，方便你在多个工作区之间跳转。',
+    },
+    { kind: 'user', text: '对话列宽能调吗？' },
+    { kind: 'assistant', text: '可以，两侧手柄拖拽即可，范围 380–1240px，宽度会记在本地。', streaming: true },
+  )
+}
+
 export function subscribeEvents(h: (e: GatewayEvent) => void): () => void {
   return gateway.on('*', h)
 }

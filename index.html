@@ -1,10 +1,25 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + Vue + Typescript App</title>
+    <title>Hemisphere</title>
+    <!-- 首帧底色:在 Vue 挂载前就填上背景,避免启动瞬间的白屏闪烁 -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #f8fafd;
+      }
+      @media (prefers-color-scheme: dark) {
+        html,
+        body {
+          background: #101419;
+        }
+      }
+    </style>
   </head>
 
   <body>
