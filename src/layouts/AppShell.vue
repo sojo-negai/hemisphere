@@ -835,11 +835,13 @@ watch(connected, (ok) => {
   font: 11px var(--font-mono);
 }
 
+/* 字重约定:Windows 下雅黑只有 400/700 两档,550/600/650 都会被吸附成整粗,
+   和会话列表(500)排在一起明显「超重」。侧栏统一用 500 表达「中等」。 */
 .workspace-copy { flex: 1; min-width: 0; }
 .workspace-copy strong {
   display: block;
   font-size: 13.5px;
-  font-weight: 600;
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -880,7 +882,7 @@ watch(connected, (ok) => {
   color: var(--accent);
 }
 
-.new-chat-label { flex: 1; text-align: left; font-weight: 550; }
+.new-chat-label { flex: 1; text-align: left; font-weight: 500; }
 
 .new-chat-kbd {
   flex: 0 0 auto;
@@ -954,7 +956,7 @@ watch(connected, (ok) => {
 .nav-item.active {
   background: var(--accent-soft);
   color: var(--accent);
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .sidebar-section {
