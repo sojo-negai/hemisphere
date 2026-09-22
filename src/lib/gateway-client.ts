@@ -218,7 +218,10 @@ export class GatewayClient {
     this.pending.clear()
   }
 
-  /** 心跳:15s 一次 ping;超过 45s 无任何入站流量判定为死链,主动断开 */
+  /**
+   * 心跳:15s 打一发协议内的 ping 方法(实测返回 {"pong":true},pong 会刷新 lastInbound);
+   * 超过 45s 没有任何入站流量则判定死链,主动断开交由上层重连。
+   */
   private startHeartbeat() {
     this.stopHeartbeat()
     this.heartbeat = window.setInterval(() => {
@@ -226,7 +229,7 @@ export class GatewayClient {
         this.close()
         return
       }
-      this.socket?.send(JSON.stringify({ type: 'ping' }))
+      this.request('ping', {}, 8000).catch(() => this.close())
     }, 15_000)
   }
 

@@ -130,6 +130,21 @@ fn stop_backend(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 摆正主窗口。
+///
+/// Windows 实测:窗口可能被创建在屏幕外且退化成标题栏大小(158x26 @ -18286,-18286),
+/// 表现为「启动失败」——进程、后端、渲染全都正常,只是界面对人不可见。
+/// 所以启动后显式设定尺寸、居中、显示,不依赖配置生效的时序。
+fn place_main_window(app: &tauri::AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = win.set_size(tauri::LogicalSize::new(1280.0, 800.0));
+    let _ = win.center();
+    let _ = win.show();
+    let _ = win.set_focus();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -138,6 +153,10 @@ pub fn run() {
             ready_file: Mutex::new(None),
         })
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            place_main_window(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![start_backend, stop_backend])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

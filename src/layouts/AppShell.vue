@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // 应用外壳:标题栏 + 侧栏 + 主区(路由出口) + 状态栏。
-import { computed, nextTick, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NDropdown, NPopover, NTooltip } from 'naive-ui'
+import { NDropdown, NInput, NModal, NPopover, NTooltip, useMessage } from 'naive-ui'
 import {
   Archive, Bell, Blocks, Check, ChevronRight, Download, ListFilter, LoaderCircle,
   MessageSquare, Moon, Plus, Search, Settings, Sun, X,
@@ -11,8 +11,14 @@ import ArchiveDialog from '../components/ArchiveDialog.vue'
 import { mod } from '../lib/platform'
 import WorkspaceDialog from '../components/WorkspaceDialog.vue'
 import { activeProfile } from '../stores/profiles'
-import { sessions, STATUS_LABEL, type SessionStatus } from '../stores/sessions.mock'
-import { backendInfo, connected, items, phase, sessionId } from '../stores/connection'
+import {
+  archiveSession, branchSession, deleteSession, noteEvent, projects, refreshAll,
+  renameSession, sessions, sessionsError, STATUS_LABEL, type SessionStatus,
+} from '../stores/sessions'
+import {
+  backendInfo, connected, items, phase, reconnectAttempt, sessionId, subscribeEvents,
+} from '../stores/connection'
+import type { GatewayEvent } from '../lib/gateway-client'
 import { useAppTheme } from '../theme'
 
 const route = useRoute()
@@ -54,7 +60,8 @@ const filters: { key: Filter; label: string }[] = [
   { key: 'platform', label: '平台' },
 ]
 
-const selectedSession = ref(sessions[0].id)
+/** 当前选中的会话;真实列表是异步拉取的,初始为空,拉到数据后取第一条 */
+const selectedSession = ref('')
 
 /* ── 搜索:仅匹配标题 ─────────────────────────── */
 const searchOpen = ref(false)
@@ -77,7 +84,7 @@ const statusFilter = ref<SessionStatus | 'all'>('all')
 /** 只经过搜索筛的集合:状态菜单的计数基于它,才能反映“可选多少” */
 const searchedSessions = computed(() => {
   const q = query.value.trim().toLowerCase()
-  return q ? sessions.filter((s) => s.title.toLowerCase().includes(q)) : sessions
+  return q ? sessions.value.filter((s) => s.title.toLowerCase().includes(q)) : sessions.value
 })
 
 /** 状态面板的开启状态 */
@@ -92,9 +99,12 @@ const statusRows = computed(() => {
   const count = (st: SessionStatus) => base.filter((s) => s.status === st).length
   return [
     { key: 'all' as const, label: '全部状态', tone: 'all', count: base.length },
-    { key: 'ok' as const, label: STATUS_LABEL.ok, tone: 'ok', count: count('ok') },
-    { key: 'confirm' as const, label: STATUS_LABEL.confirm, tone: 'confirm', count: count('confirm') },
-    { key: 'error' as const, label: STATUS_LABEL.error, tone: 'error', count: count('error') },
+    ...(['ok', 'confirm', 'error', 'none'] as SessionStatus[]).map((k) => ({
+      key: k,
+      label: STATUS_LABEL[k],
+      tone: k,
+      count: count(k),
+    })),
   ]
 })
 
@@ -136,7 +146,7 @@ const grouped = computed(() => {
     return [{ name: '', rows: visibleSessions.value }]
   }
   const field = filter.value === 'project' ? 'project' : 'platform'
-  const buckets = new Map<string, typeof sessions>()
+  const buckets = new Map<string, typeof sessions.value>()
   for (const s of visibleSessions.value) {
     const k = s[field]
     if (!buckets.has(k)) buckets.set(k, [])
@@ -168,17 +178,14 @@ const ctxOptions = computed(() => [
   { label: '分支对话', key: 'branch' },
   { type: 'divider', key: 'd1' },
   {
-    // 二级菜单:把会话归到某个项目下
+    // 二级菜单:项目清单来自内核 projects.tree
     label: '移动到项目',
     key: 'move',
-    children: [
-      { label: '新客户端', key: 'move:新客户端' },
-      { label: '未分类', key: 'move:未分类' },
-      { label: '研究', key: 'move:研究' },
-    ],
+    children: projects.value.length
+      ? projects.value.slice(0, 8).map((p) => ({ label: p.name, key: `move:${p.id}` }))
+      : [{ label: '暂无项目', key: 'move:none', disabled: true }],
   },
-  { label: '标记为已读', key: 'read' },
-  { label: '复制链接', key: 'copy' },
+  { label: '复制会话 id', key: 'copy' },
   { type: 'divider', key: 'd2' },
   { label: '归档', key: 'archive' },
   {
@@ -188,9 +195,55 @@ const ctxOptions = computed(() => [
   },
 ])
 
-function onSessionMenuSelect(key: string) {
+/** 真实动作:成功/失败都给明确反馈(不是「待接入」占位) */
+async function onSessionMenuSelect(key: string) {
   ctx.show = false
-  if (key === 'open') pickSession(ctx.id)
+  const row = sessions.value.find((s) => s.id === ctx.id)
+  if (!row) return
+  try {
+    if (key === 'open') {
+      pickSession(row.id)
+    } else if (key === 'rename') {
+      renameTarget.value = row
+      renameValue.value = row.title
+    } else if (key === 'branch') {
+      const created = await branchSession(row.id)
+      if (created) {
+        pickSession(created)
+        message.success(`已分支出新会话：${row.title}`)
+      }
+    } else if (key === 'archive') {
+      await archiveSession(row.id)
+      message.success(`已归档「${row.title}」`)
+    } else if (key === 'delete') {
+      await deleteSession(row.id)
+      message.warning(`已删除「${row.title}」`)
+    } else if (key === 'copy') {
+      await navigator.clipboard?.writeText(row.id)
+      message.success('已复制会话 id')
+    } else if (key.startsWith('move:')) {
+      message.info('内核暂未提供「会话改项目」的方法,该动作待接入')
+    }
+  } catch (e) {
+    message.error(`操作失败：${String(e)}`)
+  }
+}
+
+/* ── 重命名弹窗 ───────────────────────────────── */
+const renameTarget = ref<(typeof sessions.value)[number] | null>(null)
+const renameValue = ref('')
+
+async function commitRename() {
+  const row = renameTarget.value
+  const title = renameValue.value.trim()
+  if (!row || !title) return
+  try {
+    await renameSession(row.id, title)
+    renameTarget.value = null
+    message.success('已重命名')
+  } catch (e) {
+    message.error(`重命名失败：${String(e)}`)
+  }
 }
 
 /* ── 通知 ─────────────────────────────────────── */
@@ -208,6 +261,10 @@ function readAll() {
 const statusText = computed(() => {
   if (connected.value) return '已连接'
   if (phase.value === 'starting') return '连接中…'
+  if (phase.value === 'disconnected') {
+    return reconnectAttempt.value ? `已断开 · 重连中(${reconnectAttempt.value})` : '已断开'
+  }
+  if (phase.value === 'error') return '连接失败'
   return '未连接'
 })
 
@@ -220,6 +277,21 @@ const backendLabel = computed(() =>
 const sessionLabel = computed(() => {
   if (!sessionId.value) return '尚未创建会话'
   return `会话 ${sessionId.value.slice(0, 12)} · ${items.length} 条消息`
+})
+
+/* ── 数据装载 ─────────────────────────────────── */
+const message = useMessage()
+
+onMounted(async () => {
+  // 事件 → 状态灯(黄=等你确认、红=出错、绿=正常结束)与会话列表刷新
+  subscribeEvents((e: GatewayEvent) => noteEvent(e))
+  if (connected.value) await refreshAll()
+  if (!selectedSession.value && sessions.value[0]) selectedSession.value = sessions.value[0].id
+})
+
+// 内核是在挂载之后才连上的(启动门禁),连上就补拉一次
+watch(connected, (ok) => {
+  if (ok) void refreshAll()
 })
 </script>
 
@@ -436,23 +508,48 @@ const sessionLabel = computed(() => {
                   <span class="sub-sep">·</span>
                   <span class="session-project">{{ s.project }}</span>
                 </span>
-                <!-- 状态灯:卡片右下角 -->
+                <!-- 状态灯:卡片右下角;内核里活着时会呼吸 -->
                 <span
                   class="lamp"
-                  :class="s.status"
-                  :title="statusLabel(s.status)"
+                  :class="[s.status, { live: s.live }]"
+                  :title="s.live ? `${statusLabel(s.status)}(内核中运行中)` : statusLabel(s.status)"
                   :aria-label="statusLabel(s.status)"
                 />
               </button>
             </template>
-            <p v-if="!grouped.some((g) => g.rows.length)" class="session-empty">
+            <p v-if="sessionsError" class="session-empty">读取会话失败：{{ sessionsError }}</p>
+            <p v-else-if="!connected" class="session-empty">未连接到内核,暂不能读取会话列表</p>
+            <p v-else-if="!grouped.some((g) => g.rows.length)" class="session-empty">
               <template v-if="query && statusFilterActive">
                 没有同时匹配「{{ query }}」且状态为「{{ statusFilterLabel }}」的对话
               </template>
               <template v-else-if="query">没有匹配「{{ query }}」的对话</template>
-              <template v-else>没有状态为「{{ statusFilterLabel }}」的对话</template>
+              <template v-else-if="statusFilterActive">没有状态为「{{ statusFilterLabel }}」的对话</template>
+              <template v-else>内核里还没有会话</template>
             </p>
           </div>
+
+          <!-- 重命名会话 -->
+          <n-modal
+            :show="!!renameTarget"
+            preset="card"
+            :style="{ width: '420px' }"
+            :bordered="false"
+            title="重命名会话"
+            @update:show="(v: boolean) => { if (!v) renameTarget = null }"
+          >
+            <n-input
+              v-model:value="renameValue"
+              placeholder="会话标题"
+              @keydown.enter="commitRename"
+            />
+            <template #footer>
+              <div class="modal-foot">
+                <button class="ghost-btn" @click="renameTarget = null">取消</button>
+                <button class="primary-btn" @click="commitRename">保存</button>
+              </div>
+            </template>
+          </n-modal>
 
           <!-- 会话右键菜单:manual 触发 + 鼠标坐标定位;删除项危险色 -->
           <n-dropdown
@@ -1142,10 +1239,41 @@ const sessionLabel = computed(() => {
   animation: lamp-pulse 2s ease-in-out infinite;
 }
 .lamp.error { background: var(--danger); }
+/* 无实时信号的历史会话:静默灰点,不硬凑成绿灯 */
+.lamp.none { background: color-mix(in oklch, var(--muted) 50%, transparent); }
+/* 内核里还活着但没有明确结果的会话:让灰点呼吸,表示「正在进行」 */
+.lamp.none.live { animation: lamp-idle-pulse 1.8s ease-in-out infinite; }
 
 @keyframes lamp-pulse {
   0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--warn) 45%, transparent); }
   60% { box-shadow: 0 0 0 4px color-mix(in oklch, var(--warn) 0%, transparent); }
+}
+
+@keyframes lamp-idle-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; }
+.ghost-btn {
+  height: 30px;
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+}
+.ghost-btn:hover { border-color: var(--accent); color: var(--accent); }
+.primary-btn {
+  height: 30px;
+  padding: 0 15px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .session-empty {

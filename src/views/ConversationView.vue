@@ -108,14 +108,14 @@ const demoRows = [
     role: 'assistant',
     name: 'Hermes',
     time: '10:24',
-    text: '按「外壳常驻、视图切换」来分层：标题栏与侧栏属于外壳，对话/设置/任务三个视图在主区切换。会话列表按项目或平台分组，便于你在多个工作区之间跳转。',
+    text: '按「外壳常驻、视图切换」来分层：标题栏与侧栏属于外壳，对话/能力/设置三个视图在主区切换。会话列表按项目或平台分组，便于你在多个工作区之间跳转。',
   },
   { role: 'user', name: '你', time: '10:26', text: '对话列宽能调吗？' },
   {
     role: 'assistant',
     name: 'Hermes',
     time: '10:26',
-    text: '可以，两侧手柄拖拽即可，范围 380–1240px，宽度会记在本地。',
+    text: '可以，两侧手柄拖拽即可，范围 480–1400px，宽度会记在本地。',
   },
 ]
 
@@ -618,6 +618,7 @@ function jumpTo(index: number) {
 }
 
 .nav-btn {
+  position: relative;   /* 计数徽标要相对按钮定位,否则会跑到整条导航条的角上 */
   width: 28px;
   height: 28px;
   display: grid;

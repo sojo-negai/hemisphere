@@ -10,7 +10,7 @@ export interface BackendInfo {
   ws_url: string
 }
 
-export type Phase = 'idle' | 'starting' | 'connected' | 'error'
+export type Phase = 'idle' | 'starting' | 'connected' | 'disconnected' | 'error'
 
 // ── 响应式状态(导出即全局共享) ────────────────────────
 
@@ -46,13 +46,77 @@ export function resetTranscript() {
   streaming.value = false
 }
 
+// ── 断线重连 ──────────────────────────────────────────
+
+/** 退避序列(ms):1s → 2s → 4s → 8s → 15s → 30s 封顶 */
+const RECONNECT_BACKOFF = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000]
+/** 重试到第几次开始怀疑内核进程已死,重新 spawn */
+const RESPAWN_AFTER = 3
+
+/** 已重试次数(UI 可据此显示“重连中(3)”)*/
+export const reconnectAttempt = ref(0)
+let reconnectTimer: number | null = null
+/** 是否曾经连上过:决定断线时进 disconnected(自动重连)还是 error(交给门禁页)*/
+let hadConnection = false
+
+function clearReconnectTimer() {
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+}
+
+/** 连上并验活(不含 spawn)。ping 是协议内方法,实测返回 {"pong":true} */
+async function attach(wsUrl: string): Promise<void> {
+  await gateway.connect(wsUrl)
+  await gateway.request('ping', {}, 10_000)
+}
+
+/** 退避重连;多次失败后重新拉起后端进程(旧端口已作废)*/
+function scheduleReconnect() {
+  if (reconnectTimer !== null) return
+  const delay = RECONNECT_BACKOFF[Math.min(reconnectAttempt.value, RECONNECT_BACKOFF.length - 1)]
+  reconnectTimer = window.setTimeout(async () => {
+    reconnectTimer = null
+    reconnectAttempt.value += 1
+    try {
+      if (reconnectAttempt.value >= RESPAWN_AFTER) {
+        backendInfo.value = await invoke<BackendInfo>('start_backend')
+      }
+      const url = backendInfo.value?.ws_url
+      if (!url) throw new Error('缺少后端连接信息')
+      await attach(url)
+      phase.value = 'connected'
+      errorMessage.value = ''
+      reconnectAttempt.value = 0
+    } catch {
+      if (hadConnection) phase.value = 'disconnected'
+      scheduleReconnect()
+    }
+  }, delay)
+}
+
+/** 网关状态 → 阶段。断线后自动进入退避重连,不用用户点。 */
+gateway.onState((s: ConnectionState) => {
+  connected.value = s === 'open'
+  if (s === 'open') {
+    if (hadConnection) { phase.value = 'connected'; clearReconnectTimer() }
+    return
+  }
+  if (s === 'closed' || s === 'error') {
+    if (hadConnection) {
+      phase.value = 'disconnected'
+      scheduleReconnect()
+    }
+  }
+})
+
 // ── 动作 ──────────────────────────────────────────────
 
 /**
  * 拉起后端并建立 WebSocket 连接。
- * 步骤:Rust start_backend(spawn + 等就绪文件)→ connect(ws_url) → session.list 验活。
- * 方法名已对照 tui_gateway/methods_*.py 核实;后端无 system.ping 之类探活方法,
- * 故用最便宜的只读 RPC session.list 验证链路真的通。
+ * 步骤:Rust start_backend(spawn + 等就绪文件)→ connect(ws_url) → ping 验活。
+ * 方法名已对照 tui_gateway/contracts/*.py 核实(共 102 个方法)。
  */
 export async function startAndConnect(): Promise<void> {
   phase.value = 'starting'
@@ -60,22 +124,15 @@ export async function startAndConnect(): Promise<void> {
   try {
     const info = await invoke<BackendInfo>('start_backend')
     backendInfo.value = info
-
-    gateway.onState((s: ConnectionState) => {
-      connected.value = s === 'open'
-      if (s === 'closed' || s === 'error') {
-        phase.value = 'error'
-        errorMessage.value = s === 'error' ? '连接失败' : '连接已断开'
-      }
-    })
-
-    await gateway.connect(info.ws_url)
-    // 只读 RPC 验活:WS open ≠ 后端可用,再打一发确认方法面可达
-    await gateway.request('session.list', {}, 15_000)
+    await attach(info.ws_url)
+    hadConnection = true
+    reconnectAttempt.value = 0
     phase.value = 'connected'
   } catch (e) {
     phase.value = 'error'
     errorMessage.value = String(e)
+    // 门禁页会给出重试入口,同时在后台按退避自动重试
+    scheduleReconnect()
     throw e
   }
 }
@@ -101,10 +158,10 @@ if (import.meta.env.DEV && new URLSearchParams(location.search).has('preview')) 
     { kind: 'user', text: '帮我梳理一下新客户端的信息架构。' },
     {
       kind: 'assistant',
-      text: '按「外壳常驻、视图切换」来分层：标题栏与侧栏属于外壳，对话 / 能力 / 任务三个视图在主区切换。会话列表按项目或平台分组，方便你在多个工作区之间跳转。',
+      text: '按「外壳常驻、视图切换」来分层：标题栏与侧栏属于外壳，对话 / 能力 / 设置三个视图在主区切换。会话列表按项目或平台分组，方便你在多个工作区之间跳转。',
     },
     { kind: 'user', text: '对话列宽能调吗？' },
-    { kind: 'assistant', text: '可以，两侧手柄拖拽即可，范围 380–1240px，宽度会记在本地。', streaming: true },
+    { kind: 'assistant', text: '可以，两侧手柄拖拽即可，范围 480–1400px，宽度会记在本地。', streaming: true },
   )
 }
 
