@@ -49,6 +49,10 @@ export interface TranscriptRow {
   result?: string
   /** tool:耗时(秒) */
   duration?: number
+  /** assistant:本回合 token 用量(回合结束时挂到本回合最后一条回复行) */
+  usage?: { input: number; output: number; total: number; model?: string }
+  /** assistant:本条回复的耗时(秒)。历史行由时间戳推算,实时行由事件计时 */
+  durationS?: number
 }
 
 interface WireMessage {
@@ -79,12 +83,17 @@ export const submitStatus = ref('')
 export const storedId = ref('')
 export const runId = ref('')
 export const sessionKey = ref('')
+/** 本会话的模型(session.resume 的 info.model;内核不存逐条 usage,模型只有会话级) */
+export const sessionModel = ref('')
 
 let seq = 0
 const liveKey = (kind: string) => `live-${kind}-${++seq}`
 
 /** 正在被 delta 追加的那条 assistant 行(工具调用与旁白会把它封口) */
 let openAssistant = ''
+
+/** 本回合起点(秒):发送或收到第一个 delta 时记下,回合结束算整回合耗时 */
+let turnStartAt = 0
 
 function hhmm(ts?: number | null): string {
   if (!ts) return ''
@@ -94,6 +103,7 @@ function hhmm(ts?: number | null): string {
 
 function normalize(msgs: WireMessage[]): TranscriptRow[] {
   const out: TranscriptRow[] = []
+  let lastUserTs = 0
   msgs.forEach((m, i) => {
     // 内核标记为不显示的行(例如注入的系统提示)不进界面
     if (m.display_kind === 'hidden') return
@@ -107,13 +117,20 @@ function normalize(msgs: WireMessage[]): TranscriptRow[] {
       })
       return
     }
-    out.push({
+    const row: TranscriptRow = {
       key,
       kind: m.role === 'user' ? 'user' : 'assistant',
       text: (m.text ?? '').trim(),
       time: hhmm(m.timestamp),
       reasoning: (m.reasoning ?? '').trim() || undefined,
-    })
+    }
+    // 历史行没有逐条 token(内核只在 message.complete 事件里给 usage);
+    // 能推出的只有「上一条用户消息 → 本条回复」的时间戳差,当耗时展示
+    if (row.kind === 'user') lastUserTs = m.timestamp ?? 0
+    else if (m.timestamp && lastUserTs && m.timestamp > lastUserTs) {
+      row.durationS = m.timestamp - lastUserTs
+    }
+    out.push(row)
   })
   return out
 }
@@ -132,6 +149,7 @@ export async function openSession(id: string): Promise<void> {
       messages_omitted?: boolean
       status?: string | null
       running?: boolean | null
+      info?: { model?: string } | null
     }>('session.resume', { session_id: id }, 30_000)
 
     rows.value = normalize(snap.messages ?? [])
@@ -144,6 +162,7 @@ export async function openSession(id: string): Promise<void> {
     turnActive.value = !!snap.running
     submitStatus.value = ''
     openAssistant = ''
+    sessionModel.value = snap.info?.model ?? ''
   } catch (e) {
     rows.value = []
     loadError.value = e instanceof Error ? e.message : String(e)
@@ -164,7 +183,9 @@ export function clearTranscript(): void {
   storedId.value = ''
   runId.value = ''
   sessionKey.value = ''
+  sessionModel.value = ''
   openAssistant = ''
+  turnStartAt = 0
 }
 
 function pushSystem(text: string): void {
@@ -210,6 +231,7 @@ export async function sendPrompt(text: string): Promise<void> {
   // 乐观插入:先上屏,不等内核回包
   rows.value.push({ key: liveKey('u'), kind: 'user', text: t, time: hhmm(Date.now() / 1000) })
   turnActive.value = true
+  turnStartAt = Date.now() / 1000
   try {
     const res = await gateway.request<{ status?: string }>(
       'prompt.submit', { session_id: runId.value, text: t }, 30_000,
@@ -232,7 +254,53 @@ export async function interruptTurn(): Promise<void> {
   }
 }
 
+/**
+ * 重新生成最后一回合:session.undo 把「最后一个用户回合及其后一切」从内核
+ * 历史里丢掉(契约要求会话空闲),本地截掉同一段,再把那条用户消息原样重发。
+ */
+export async function regenerateLastTurn(): Promise<void> {
+  if (!runId.value || turnActive.value) return
+  const list = rows.value
+  let i = -1
+  for (let k = list.length - 1; k >= 0; k--) {
+    if (list[k].kind === 'user') { i = k; break }
+  }
+  if (i < 0) return
+  const text = list[i].text
+  try {
+    await gateway.request('session.undo', { session_id: runId.value }, 15_000)
+  } catch (e) {
+    pushSystem(`重新生成失败：${e instanceof Error ? e.message : String(e)}`)
+    return
+  }
+  rows.value = list.slice(0, i)
+  await sendPrompt(text)
+}
+
 const str = (v: unknown) => (typeof v === 'string' ? v : '')
+
+/**
+ * 回合结束时把 usage 与整回合耗时挂到本回合最后一条 assistant 行上。
+ * usage 形状(契约 contracts/common.py::Usage):{ model, input, output, total, … }
+ */
+function attachTurnFootnote(p: Record<string, unknown>): void {
+  const u = p.usage as Record<string, unknown> | undefined
+  const input = typeof u?.input === 'number' ? u.input : 0
+  const output = typeof u?.output === 'number' ? u.output : 0
+  const total = typeof u?.total === 'number' ? u.total : input + output
+  const model = typeof u?.model === 'string' ? u.model : undefined
+  let last = -1
+  for (let i = rows.value.length - 1; i >= 0; i--) {
+    if (rows.value[i].kind === 'assistant') { last = i; break }
+  }
+  if (last < 0) { turnStartAt = 0; return }
+  const row = rows.value[last]
+  if (input > 0 || output > 0 || total > 0) row.usage = { input, output, total, model }
+  if (turnStartAt) {
+    row.durationS = Math.max(0.1, Date.now() / 1000 - turnStartAt)
+    turnStartAt = 0
+  }
+}
 
 /**
  * 把内核事件落到当前会话的消息列表。
@@ -252,6 +320,8 @@ export function noteTranscriptEvent(e: GatewayEvent): void {
       const text = str(p.text)
       if (!text) return
       turnActive.value = true
+      // 不是本地发送触发的回合(插话/后台/断线重连接上正在跑的)也要有计时起点
+      if (!turnStartAt) turnStartAt = Date.now() / 1000
       appendAssistant(text, 'text')
       return
     }
@@ -307,6 +377,7 @@ export function noteTranscriptEvent(e: GatewayEvent): void {
       turnActive.value = false
       running.value = false
       liveStatus.value = 'idle'
+      attachTurnFootnote(p)
       const status = str(p.status)
       if (status === 'error') {
         pushSystem(`本轮出错:  ${str(p.error) || str(p.failure_reason) || '未知原因'}`)

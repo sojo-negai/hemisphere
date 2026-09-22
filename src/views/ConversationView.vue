@@ -4,10 +4,10 @@
 // demoRows 只在浏览器预览(?preview=1,即 isPreview)时出现,走同一套渲染,
 // 用于在没有内核时审阅排版(含 markdown / 折叠块)。
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { NDropdown, NPopover, NTooltip } from 'naive-ui'
+import { NDropdown, NPopover, NTooltip, useMessage } from 'naive-ui'
 import {
-  ArrowDownToLine, ArrowUpToLine, ChevronDown, ChevronRight, ChevronUp, GitBranch,
-  LayoutGrid, MoreHorizontal, Send, Square,
+  ArrowDownToLine, ArrowUpToLine, ChevronDown, ChevronRight, ChevronUp, Copy, GitBranch,
+  LayoutGrid, MoreHorizontal, RefreshCw, Send, Square,
 } from 'lucide-vue-next'
 import { connected, draft, phase } from '../stores/connection'
 import { isPreview } from '../lib/preview'
@@ -15,7 +15,8 @@ import { renderMarkdown } from '../lib/markdown'
 import { selectedId, sessions } from '../stores/sessions'
 import {
   clearTranscript, interruptTurn, loadError, loading as transcriptLoading, omitted, openSession,
-  rows as transcriptRows, sendPrompt, submitStatus, turnActive, type TranscriptRow,
+  regenerateLastTurn, rows as transcriptRows, runId, sendPrompt, sessionModel, submitStatus,
+  turnActive, type TranscriptRow,
 } from '../stores/transcript'
 
 const transcriptEl = ref<HTMLElement | null>(null)
@@ -149,6 +150,8 @@ const demoRows: TranscriptRow[] = [
       '- **内核**:`hermes serve`,会话与工具都归它\n\n' +
       '> 会话列表按项目或平台分组,方便你在多个工作区之间跳转。\n\n' +
       '```ts\nconst layers = ["shell", "view", "kernel"] as const\n```',
+    usage: { input: 312, output: 1240, total: 1552, model: 'deepseek-v4-flash' },
+    durationS: 8.4,
   },
   { key: 'd3', kind: 'user', text: '对话列宽能调吗?', time: '10:26' },
   {
@@ -160,6 +163,8 @@ const demoRows: TranscriptRow[] = [
   {
     key: 'd5', kind: 'assistant', time: '10:26',
     text: '可以,两侧手柄拖拽即可,范围 480–1400px,宽度会记在本地。',
+    usage: { input: 890, output: 42, total: 932, model: 'deepseek-v4-flash' },
+    durationS: 2.1,
   },
 ]
 
@@ -217,6 +222,60 @@ function jumpTo(index: number) {
 function jumpToMessage(index: number) {
   msgPickerOpen.value = false // 定位后关掉面板,别让它盖着刚跳过去的消息
   jumpTo(index)
+}
+
+/* ── 消息脚注:token / 耗时 / 复制 / 重新生成 ─────── */
+const message = useMessage()
+
+/** 1234 → 1.2k;小数字直接给 */
+function fmtTok(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+function fmtDur(s: number): string {
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m${Math.round(s % 60)}s`
+}
+
+/**
+ * 脚注摘要:token(仅实时回合有——内核不逐条持久化 usage)· 耗时 · 模型
+ * (逐条 usage 里带 model 优先,否则退到会话级 session.resume info.model)。
+ * 输入/输出是一组,内部用「/」绑定;「·」只用来分隔不同字段。
+ */
+function footMeta(row: TranscriptRow): string {
+  const parts: string[] = []
+  if (row.usage) parts.push(`输入 ${fmtTok(row.usage.input)} / 输出 ${fmtTok(row.usage.output)}`)
+  if (row.durationS != null) parts.push(fmtDur(row.durationS))
+  const model = row.usage?.model || sessionModel.value
+  if (model) parts.push(model)
+  return parts.join(' · ')
+}
+
+async function copyRow(row: TranscriptRow) {
+  try {
+    await navigator.clipboard.writeText(row.text)
+    message.success('已复制回复')
+  } catch {
+    message.error('复制失败')
+  }
+}
+
+/** 最后一条已完成的 assistant 行:只有它能「重新生成」 */
+const lastAssistantKey = computed(() => {
+  const list = renderRows.value
+  for (let i = list.length - 1; i >= 0; i--) {
+    const r = list[i]
+    if (r.kind === 'assistant' && !r.streaming) return r.key
+  }
+  return ''
+})
+
+function canRegenerate(row: TranscriptRow): boolean {
+  return !isDemo.value && !!row.text && row.key === lastAssistantKey.value
+    && !turnActive.value && connected.value && !!runId.value
+}
+
+async function onRegenerate() {
+  await regenerateLastTurn()
 }
 
 </script>
@@ -295,6 +354,21 @@ function jumpToMessage(index: number) {
               <!-- 助手正文:markdown 渲染(已消毒) -->
               <div v-if="row.kind === 'assistant' && (row.text || !row.reasoning)" class="message-text md">
                 <span v-html="renderMarkdown(row.text)"></span><span v-if="row.streaming" class="caret">▍</span>
+              </div>
+
+              <!-- 脚注:摘要常驻,动作悬停浮现 -->
+              <div v-if="row.kind === 'assistant' && row.text && !row.streaming" class="msg-foot">
+                <span v-if="footMeta(row)" class="foot-meta"
+                      title="输入 = 本回合发给模型的上下文 token;输出 = 模型生成 token">
+                  {{ footMeta(row) }}
+                </span>
+                <span class="foot-spacer" />
+                <button class="foot-btn" type="button" title="复制这条回复" @click="copyRow(row)">
+                  <Copy :size="12" /> 复制
+                </button>
+                <button v-if="canRegenerate(row)" class="foot-btn" type="button" title="撤销最后一回合并重新发送" @click="onRegenerate">
+                  <RefreshCw :size="12" /> 重新生成
+                </button>
               </div>
 
               <!-- 用户消息:纯文本 -->
@@ -815,6 +889,32 @@ function jumpToMessage(index: number) {
 }
 
 .md :deep(img) { max-width: 100%; border-radius: 8px; }
+
+/* ── 消息脚注:用量摘要常驻,动作悬停浮现 ──────────── */
+.msg-foot {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 5px;
+}
+.foot-meta { color: var(--muted); font: 12px var(--font-mono); }
+.foot-spacer { flex: 1; }
+
+.foot-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.message:hover .foot-btn { opacity: 1; }
+.foot-btn:hover { background: var(--fg-soft); color: var(--fg); }
 
 /* 输入区 */
 .composer-wrap {
