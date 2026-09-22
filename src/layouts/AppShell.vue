@@ -15,9 +15,10 @@ import {
   archiveSession, branchSession, deleteSession, noteEvent, projects, refreshAll,
   renameSession, selectedId, sessions, sessionsError, STATUS_LABEL, type SessionStatus,
 } from '../stores/sessions'
+import { backendInfo, connected, phase, reconnectAttempt, subscribeEvents } from '../stores/connection'
 import {
-  backendInfo, connected, items, phase, reconnectAttempt, sessionId, subscribeEvents,
-} from '../stores/connection'
+  noteTranscriptEvent, rows as transcriptRows, storedId, turnActive,
+} from '../stores/transcript'
 import type { GatewayEvent } from '../lib/gateway-client'
 import { useAppTheme } from '../theme'
 
@@ -192,7 +193,7 @@ const ctxOptions = computed(() => [
   },
 ])
 
-/** 真实动作:成功/失败都给明确反馈(不是「待接入」占位) */
+/** 侧栏会话的右键动作:成功与失败都给明确反馈 */
 async function onSessionMenuSelect(key: string) {
   ctx.show = false
   const row = sessions.value.find((s) => s.id === ctx.id)
@@ -218,9 +219,8 @@ async function onSessionMenuSelect(key: string) {
     } else if (key === 'copy') {
       await navigator.clipboard?.writeText(row.id)
       message.success('已复制会话 id')
-    } else if (key.startsWith('move:')) {
-      message.info('内核暂未提供「会话改项目」的方法,该动作待接入')
     }
+    // 子菜单里的「移动到项目」暂不做动作:内核按 cwd 归项目,没有改归属的方法
   } catch (e) {
     message.error(`操作失败：${String(e)}`)
   }
@@ -272,8 +272,9 @@ const backendLabel = computed(() =>
 
 /** 当前会话摘要 */
 const sessionLabel = computed(() => {
-  if (!sessionId.value) return '尚未创建会话'
-  return `会话 ${sessionId.value.slice(0, 12)} · ${items.length} 条消息`
+  if (!storedId.value) return '未打开会话'
+  return `会话 ${storedId.value.slice(0, 12)} · ${transcriptRows.value.length} 条消息`
+    + (turnActive.value ? ' · 生成中' : '')
 })
 
 /* ── 数据装载 ─────────────────────────────────── */
@@ -281,7 +282,10 @@ const message = useMessage()
 
 onMounted(async () => {
   // 事件 → 状态灯(黄=等你确认、红=出错、绿=正常结束)与会话列表刷新
-  subscribeEvents((e: GatewayEvent) => noteEvent(e))
+  subscribeEvents((e: GatewayEvent) => {
+    noteEvent(e)             // 侧栏状态灯
+    noteTranscriptEvent(e)   // 对话区的实时流(按会话过滤)
+  })
   if (connected.value) await refreshAll()
   if (!selectedId.value && sessions.value[0]) selectedId.value = sessions.value[0].id
 })
@@ -587,8 +591,8 @@ watch(connected, (ok) => {
         </template>
         <div class="detail-panel">
           <div class="detail-row"><span>连接状态</span><strong>{{ statusText }}</strong></div>
-          <div class="detail-row"><span>会话 ID</span><strong>{{ sessionId || '—' }}</strong></div>
-          <div class="detail-row"><span>消息条数</span><strong>{{ items.length }}</strong></div>
+          <div class="detail-row"><span>会话 ID</span><strong>{{ storedId || '—' }}</strong></div>
+          <div class="detail-row"><span>消息条数</span><strong>{{ transcriptRows.length }}</strong></div>
           <div class="detail-row"><span>后端端口</span><strong>{{ backendInfo ? backendInfo.port : '—' }}</strong></div>
           <div class="detail-row detail-wrap">
             <span>WS 地址</span><strong>{{ backendInfo ? backendInfo.ws_url.replace(/token=.*/, 'token=***') : '—' }}</strong>

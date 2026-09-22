@@ -1,21 +1,20 @@
 <script setup lang="ts">
 // 对话视图:会话头 + 可拖拽调宽的消息流 + 输入区 + 消息导航。
-// 目前消息来自 stores/connection 的真实状态;未连接时用示例数据撑起布局,
-// 待接入后端后删掉 demo 分支即可(见 isDemo)。
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+// 消息一律来自 stores/transcript(历史 + 实时流同一来源);
+// demoRows 只在浏览器预览(?preview=1,即 isPreview)时出现,用于在没有内核时审阅排版。
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { NDropdown, NPopover, NTooltip } from 'naive-ui'
 import {
   ArrowDownToLine, ArrowUpToLine, ChevronDown, ChevronUp, GitBranch, LayoutGrid,
   MoreHorizontal, Send,
 } from 'lucide-vue-next'
-import {
-  connected, draft, handleEvent, items, phase, send, streaming, subscribeEvents,
-} from '../stores/connection'
+import { connected, draft, phase } from '../stores/connection'
+import { Square } from 'lucide-vue-next'
 import { isPreview } from '../lib/preview'
 import { selectedId, sessions } from '../stores/sessions'
 import {
-  clearTranscript, loadError, loading as transcriptLoading, omitted, openSession,
-  rows as transcriptRows,
+  clearTranscript, interruptTurn, loadError, loading as transcriptLoading, omitted, openSession,
+  rows as transcriptRows, sendPrompt, submitStatus, turnActive,
 } from '../stores/transcript'
 
 const transcriptEl = ref<HTMLElement | null>(null)
@@ -61,16 +60,10 @@ function startResize(e: PointerEvent, dir: number) {
   window.addEventListener('pointerup', up)
 }
 
-/* ── 事件订阅与滚动 ───────────────────────────── */
-let unsubscribe: (() => void) | null = null
+/* ── 宽度记忆(事件在 AppShell 里统一分发)─────── */
 onMounted(() => {
   stageEl.value?.style.setProperty('--chat-w', `${chatW.value}px`)
-  unsubscribe = subscribeEvents((e) => {
-    handleEvent(e)
-    void nextTick(scrollToBottom)
-  })
 })
-onUnmounted(() => unsubscribe?.())
 
 // 侧栏换会话 → 清掉上一份历史再拉新的;拉完回到最新一条
 watch(selectedId, (id) => {
@@ -80,10 +73,31 @@ watch(selectedId, (id) => {
 
 watch(transcriptRows, () => void nextTick(scrollToBottom))
 
+/** 用户是否停在底部附近:只有在这儿才自动跟随流式输出 */
+const stickToBottom = ref(true)
+
+function onTranscriptScroll() {
+  const el = transcriptEl.value
+  if (!el) return
+  stickToBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+}
+
 function scrollToBottom() {
   const el = transcriptEl.value
   if (el) el.scrollTop = el.scrollHeight
 }
+
+// 行数变化或最后一行变长都算「有新内容」
+watch(
+  () => {
+    const list = transcriptRows.value
+    const last = list[list.length - 1]
+    return `${list.length}:${last ? last.text.length + (last.reasoning?.length ?? 0) : 0}`
+  },
+  () => {
+    if (stickToBottom.value) void nextTick(scrollToBottom)
+  },
+)
 
 function scrollToTop() {
   const el = transcriptEl.value
@@ -96,42 +110,8 @@ interface UserMessage {
   text: string
   time: string
 }
-/**
- * 渲染用的行:内核历史(transcriptRows)在前,本轮实时流(items)在后。
- * 两处合成一个列表,消息导航的下标才和真实渲染顺序一致。
- */
-interface RenderRow {
-  key: string
-  kind: 'user' | 'assistant' | 'tool' | 'system'
-  text: string
-  time: string
-  name?: string
-  context?: string
-  args?: string
-  reasoning?: string
-  streaming?: boolean
-}
-
-const renderRows = computed<RenderRow[]>(() => [
-  ...transcriptRows.value.map((r) => ({
-    key: r.key,
-    kind: r.kind,
-    text: r.text,
-    time: r.time,
-    name: r.name,
-    context: r.context,
-    args: r.args,
-    reasoning: r.reasoning,
-  })),
-  // items 来自 connection store,是 reactive 数组(不是 ref)
-  ...items.map((it, i) => ({
-    key: `live-${i}`,
-    kind: it.kind as RenderRow['kind'],
-    text: it.text,
-    time: '',
-    streaming: it.streaming,
-  })),
-])
+/** 渲染列表:历史与实时流同源于 transcript store,消息导航下标才与渲染顺序一致 */
+const renderRows = transcriptRows
 
 /** 会话头标题:取侧栏那条真实会话的标题 */
 const currentTitle = computed(
@@ -178,14 +158,16 @@ const demoRows = [
 /* ── 发送 ─────────────────────────────────────── */
 async function onSend() {
   const text = draft.value.trim()
-  if (!text) return
-  if (!connected.value) {
-    // 未连接时把内容留在输入框,并提示需要先连后端
-    return
-  }
+  if (!text || !connected.value) return
   draft.value = ''
-  await send(text)
+  stickToBottom.value = true
+  await sendPrompt(text)
   void nextTick(scrollToBottom)
+}
+
+/** 中断当前回合 */
+async function onStop() {
+  await interruptTurn()
 }
 
 /** 空会话:用于把空态在消息区里垂直居中 */
@@ -233,7 +215,12 @@ function jumpTo(index: number) {
 
     <!-- 消息流(两侧手柄可拖拽调宽) -->
     <div ref="stageEl" class="chat-stage">
-      <section ref="transcriptEl" class="transcript" :class="{ blank: isBlank }">
+      <section
+        ref="transcriptEl"
+        class="transcript"
+        :class="{ blank: isBlank }"
+        @scroll.passive="onTranscriptScroll"
+      >
         <!-- 手柄贴在聊天列两侧;高度跟随消息区,不随滚动位移 -->
         <div class="chat-frame" aria-hidden="true">
           <div class="chat-handle left" role="separator" aria-label="调整对话宽度" @pointerdown="startResize($event, -1)" />
@@ -285,7 +272,14 @@ function jumpTo(index: number) {
                 </div>
                 <!-- 工具行:参数是 JSON 字符串,原样显示但限高 -->
                 <div v-if="row.kind === 'tool'" class="message-text tool-args">
-                  {{ row.args || row.context }}
+                  <div v-if="row.running" class="tool-running">执行中…</div>
+                  <div>{{ row.args || row.context }}</div>
+                  <div v-if="row.result" class="tool-result">
+                    <span class="tool-result-label">
+                      返回{{ row.duration != null ? ` · ${row.duration.toFixed(1)}s` : '' }}
+                    </span>
+                    {{ row.result }}
+                  </div>
                 </div>
                 <!-- 纯思考行:text 为空,只有推理,否则这行会空白 -->
                 <div v-else-if="!row.text && row.reasoning" class="message-reasoning">
@@ -311,12 +305,24 @@ function jumpTo(index: number) {
           />
           <div class="composer-foot">
             <span class="hint">
-              <template v-if="streaming">正在生成…</template>
+              <template v-if="submitStatus === 'queued'">已排队，等当前回合结束</template>
+              <template v-else-if="submitStatus === 'steered'">已作为插话送出</template>
+              <template v-else-if="turnActive">正在生成…</template>
               <template v-else-if="phase === 'starting'">正在启动 hermes serve…</template>
               <template v-else-if="!connected">Enter 发送 · 先连接后端</template>
               <template v-else>Enter 发送 · Shift+Enter 换行</template>
             </span>
-            <button class="send" type="submit" :disabled="!connected || streaming || !draft.trim()">
+            <!-- 生成中给「停止」;忙碌时仍可直接发送,内核会排队或按插话处理 -->
+            <button
+              v-if="turnActive"
+              class="send stop"
+              type="button"
+              aria-label="停止生成"
+              @click="onStop"
+            >
+              <Square :size="13" />
+            </button>
+            <button class="send" type="submit" :disabled="!connected || !draft.trim()">
               <Send :size="15" />
             </button>
           </div>
@@ -773,6 +779,30 @@ function jumpTo(index: number) {
 .mine-empty { margin: 0; padding: 18px 13px; color: var(--muted); font-size: 11.5px; text-align: center; }
 
 .jump-flash :deep(.message-text) { background: var(--accent-soft); }
+
+/* 停止按钮:生成中出现在发送键左侧,用危险色区分 */
+.send.stop {
+  color: var(--danger);
+  border-color: color-mix(in oklch, var(--danger) 40%, var(--border));
+}
+
+.send.stop:hover { background: color-mix(in oklch, var(--danger) 12%, transparent); }
+
+/* 工具行:执行中与返回值 */
+.tool-running {
+  margin-bottom: 4px;
+  color: var(--warn);
+  font-size: 11px;
+}
+
+.tool-result {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  color: var(--muted);
+}
+
+.tool-result-label { color: var(--fg); font-weight: 500; }
 
 /* 载入 / 已省略提示:居中一行小字,不占满整个消息区 */
 .transcript-hint {

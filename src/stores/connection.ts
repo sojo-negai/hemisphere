@@ -1,6 +1,7 @@
 // 连接与会话状态:纯 ref/reactive,不引状态库。
 
-import { ref, reactive } from 'vue'
+import { ref } from 'vue'
+import { isPreview } from '../lib/preview'
 import { invoke } from '@tauri-apps/api/core'
 import { GatewayClient, type GatewayEvent, type ConnectionState } from '../lib/gateway-client'
 
@@ -20,31 +21,13 @@ export const errorMessage = ref('')
 /** WebSocket 是否处于 open(与 phase 分开:断线时 phase 仍可为 connected) */
 export const connected = ref(false)
 
-export interface TranscriptItem {
-  kind: 'user' | 'assistant' | 'system'
-  text: string
-  /** assistant 专属:流式输出中,尾部渲染闪烁光标 */
-  streaming?: boolean
-}
-
-/** 会话流。reactive 数组可直接 push / 改属性,无需不可变拷贝 */
-export const items = reactive<TranscriptItem[]>([])
+/** 输入框草稿(消息流在 stores/transcript.ts) */
 export const draft = ref('')
-export const streaming = ref(false)
-
-/** 当前活动会话 id(session.create 之后回填) */
-export const sessionId = ref('')
 
 /** 后端连接信息(端口/令牌/WS 地址),连接成功后回填,供状态栏与会话详情展示 */
 export const backendInfo = ref<BackendInfo | null>(null)
 
 export const gateway = new GatewayClient()
-
-/** 清空会话流(新对话时用) */
-export function resetTranscript() {
-  items.splice(0, items.length)
-  streaming.value = false
-}
 
 // ── 断线重连 ──────────────────────────────────────────
 
@@ -137,83 +120,22 @@ export async function startAndConnect(): Promise<void> {
   }
 }
 
-/** 订阅全部网关事件(组件 onMounted 时挂上) */
-/**
- * 浏览器内预览开关(?preview=1)。
- * Tauri 之外无法调用 Rust 的 start_backend,做界面时用假连接状态渲染主界面;
- * 仅在开发构建生效(import.meta.env.DEV),生产包中该分支会被摇树移除。
- */
-if (import.meta.env.DEV && new URLSearchParams(location.search).has('preview')) {
+// 浏览器内预览(?preview=1):Tauri 之外调不到 Rust 的 start_backend,
+// 用假连接状态把主界面撑起来;仅开发构建生效,生产包里该分支被摇树移除。
+// 这里只造假「连接」,不造会话数据 —— 界面示例由各自的视图提供。
+if (isPreview) {
   const port = 51234
   backendInfo.value = {
     port,
     token: 'preview-token',
     ws_url: `ws://127.0.0.1:${port}/api/ws?token=preview-token`,
   }
-  sessionId.value = 'preview_session_0001'
   connected.value = true
   phase.value = 'connected'
-  // 示例消息:让消息流样式可在浏览器里审阅
-  items.push(
-    { kind: 'user', text: '帮我梳理一下新客户端的信息架构。' },
-    {
-      kind: 'assistant',
-      text: '按「外壳常驻、视图切换」来分层：标题栏与侧栏属于外壳，对话 / 能力 / 设置三个视图在主区切换。会话列表按项目或平台分组，方便你在多个工作区之间跳转。',
-    },
-    { kind: 'user', text: '对话列宽能调吗？' },
-    { kind: 'assistant', text: '可以，两侧手柄拖拽即可，范围 480–1400px，宽度会记在本地。', streaming: true },
-  )
 }
+
+/** 订阅全部网关事件(组件 onMounted 时挂上) */
 
 export function subscribeEvents(h: (e: GatewayEvent) => void): () => void {
   return gateway.on('*', h)
-}
-
-/**
- * 发送一条用户消息。
- * 流程:session.create(若尚无会话)→ prompt.submit;
- * 助手回复以 message.delta / message.complete 事件异步推送,由 handleEvent 归并。
- */
-export async function send(text: string): Promise<void> {
-  if (!text.trim() || streaming.value) return
-  items.push({ kind: 'user', text })
-  try {
-    if (!sessionId.value) {
-      // 已实测:session.create 返回 { session_id, stored_session_id, message_count, messages, info }
-      const created = await gateway.request<{ session_id?: string }>('session.create', {}, 30_000)
-      sessionId.value = created.session_id ?? ''
-    }
-    // 已实测:prompt.submit 接受 params.session_id + params.text
-    await gateway.request('prompt.submit', { session_id: sessionId.value, text }, 30_000)
-  } catch (e) {
-    items.push({ kind: 'system', text: `提交失败：${String(e)}` })
-  }
-}
-
-/**
- * 事件 → 会话流的归并规则:
- * - message.delta:追加文本;若最后一条还是同一条流式 assistant 消息则原地续写
- * - message.complete:该条流式消息收尾(光标消失)
- * - error:以系统条目呈现,不打断已有内容
- */
-export function handleEvent(e: GatewayEvent) {
-  const p = (e.payload ?? {}) as Record<string, unknown>
-  if (e.type === 'message.delta') {
-    const text = typeof p.text === 'string' ? p.text : ''
-    if (!text) return
-    streaming.value = true
-    const last = items[items.length - 1]
-    if (last && last.kind === 'assistant' && last.streaming) {
-      last.text += text
-    } else {
-      items.push({ kind: 'assistant', text, streaming: true })
-    }
-  } else if (e.type === 'message.complete') {
-    const last = items[items.length - 1]
-    if (last && last.kind === 'assistant') last.streaming = false
-    streaming.value = false
-  } else if (e.type === 'error') {
-    const msg = typeof p.message === 'string' ? p.message : JSON.stringify(p)
-    items.push({ kind: 'system', text: `错误：${msg}` })
-  }
 }

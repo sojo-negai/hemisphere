@@ -130,40 +130,6 @@ fn stop_backend(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 摆正主窗口。
-///
-/// Windows 上实测到两种形态,都会让人以为「启动失败」(进程/后端/渲染其实都正常):
-///   1) 窗口以 158x26 且落在屏幕外 (-18286,-18286) 的退化几何出现;
-///   2) setup 执行时窗口还没建好(WebView2 刚起),此时取窗口拿到 None,
-///      于是「启动时摆正一次」只是碰运气 —— 有时生效,有时整场都在屏幕外。
-/// 所以放到后台线程轮询:拿到窗口后检查几何,退化才纠正,正常则只显示并聚焦。
-fn place_main_window(app: &tauri::AppHandle) {
-    let handle = app.clone();
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(8);
-        while std::time::Instant::now() < deadline {
-            if let Some(win) = handle.get_webview_window("main") {
-                let sane = match (win.outer_size(), win.outer_position()) {
-                    (Ok(s), Ok(p)) => {
-                        s.width >= 700 && s.height >= 450 && p.x > -4000 && p.y > -4000
-                    }
-                    _ => false,
-                };
-                if !sane {
-                    let _ = win.set_size(tauri::LogicalSize::new(1280.0, 800.0));
-                    let _ = win.center();
-                }
-                let _ = win.show();
-                let _ = win.set_focus();
-                if sane {
-                    return;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(80));
-        }
-    });
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -172,10 +138,6 @@ pub fn run() {
             ready_file: Mutex::new(None),
         })
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            place_main_window(app.handle());
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![start_backend, stop_backend])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
