@@ -11,6 +11,12 @@ import {
 import {
   connected, draft, handleEvent, items, phase, send, streaming, subscribeEvents,
 } from '../stores/connection'
+import { isPreview } from '../lib/preview'
+import { selectedId, sessions } from '../stores/sessions'
+import {
+  clearTranscript, loadError, loading as transcriptLoading, omitted, openSession,
+  rows as transcriptRows,
+} from '../stores/transcript'
 
 const transcriptEl = ref<HTMLElement | null>(null)
 const stageEl = ref<HTMLElement | null>(null)
@@ -66,6 +72,14 @@ onMounted(() => {
 })
 onUnmounted(() => unsubscribe?.())
 
+// 侧栏换会话 → 清掉上一份历史再拉新的;拉完回到最新一条
+watch(selectedId, (id) => {
+  clearTranscript()
+  void openSession(id)
+}, { immediate: true })
+
+watch(transcriptRows, () => void nextTick(scrollToBottom))
+
 function scrollToBottom() {
   const el = transcriptEl.value
   if (el) el.scrollTop = el.scrollHeight
@@ -82,6 +96,48 @@ interface UserMessage {
   text: string
   time: string
 }
+/**
+ * 渲染用的行:内核历史(transcriptRows)在前,本轮实时流(items)在后。
+ * 两处合成一个列表,消息导航的下标才和真实渲染顺序一致。
+ */
+interface RenderRow {
+  key: string
+  kind: 'user' | 'assistant' | 'tool' | 'system'
+  text: string
+  time: string
+  name?: string
+  context?: string
+  args?: string
+  reasoning?: string
+  streaming?: boolean
+}
+
+const renderRows = computed<RenderRow[]>(() => [
+  ...transcriptRows.value.map((r) => ({
+    key: r.key,
+    kind: r.kind,
+    text: r.text,
+    time: r.time,
+    name: r.name,
+    context: r.context,
+    args: r.args,
+    reasoning: r.reasoning,
+  })),
+  // items 来自 connection store,是 reactive 数组(不是 ref)
+  ...items.map((it, i) => ({
+    key: `live-${i}`,
+    kind: it.kind as RenderRow['kind'],
+    text: it.text,
+    time: '',
+    streaming: it.streaming,
+  })),
+])
+
+/** 会话头标题:取侧栏那条真实会话的标题 */
+const currentTitle = computed(
+  () => sessions.value.find((s) => s.id === selectedId.value)?.title || '未选择会话',
+)
+
 const userMessages = computed<UserMessage[]>(() => {
   const out: UserMessage[] = []
   if (isDemo.value) {
@@ -89,8 +145,8 @@ const userMessages = computed<UserMessage[]>(() => {
       if (r.role === 'user') out.push({ index: i, text: r.text, time: r.time })
     })
   } else {
-    items.forEach((it, i) => {
-      if (it.kind === 'user') out.push({ index: i, text: it.text, time: '' })
+    renderRows.value.forEach((r, i) => {
+      if (r.kind === 'user') out.push({ index: i, text: r.text, time: r.time })
     })
   }
   return out
@@ -101,7 +157,7 @@ function jumpToMessage(index: number) {
 }
 
 /* ── 示例数据(仅为验证布局,接入后端后删除)──────── */
-const isDemo = computed(() => items.length === 0 && !connected.value)
+const isDemo = computed(() => isPreview)
 const demoRows = [
   { role: 'user', name: '你', time: '10:24', text: '帮我梳理一下新客户端的信息架构。' },
   {
@@ -133,7 +189,7 @@ async function onSend() {
 }
 
 /** 空会话:用于把空态在消息区里垂直居中 */
-const isBlank = computed(() => !isDemo.value && items.length === 0)
+const isBlank = computed(() => !isDemo.value && !transcriptLoading.value && renderRows.value.length === 0)
 
 /* ── 消息导航 ─────────────────────────────────── */
 const cursor = ref(-1)
@@ -155,7 +211,7 @@ function jumpTo(index: number) {
     <!-- 会话头 -->
     <header class="conversation-head">
       <div class="conversation-title">
-        <h1>梳理新客户端的信息架构</h1>
+        <h1>{{ currentTitle }}</h1>
       </div>
       <div class="head-actions">
         <n-tooltip trigger="hover">
@@ -184,14 +240,18 @@ function jumpTo(index: number) {
           <div class="chat-handle right" role="separator" aria-label="调整对话宽度" @pointerdown="startResize($event, 1)" />
         </div>
         <div class="chat-col">
-          <!-- 空状态:已连接但尚未产生消息 -->
-          <div v-if="!isDemo && items.length === 0" class="blank-state">
+          <!-- 载入 / 失败 / 空态,正常有消息时才显示日期分隔 -->
+          <div v-if="transcriptLoading" class="transcript-hint">正在载入历史…</div>
+          <div v-else-if="loadError" class="transcript-hint error">读取历史失败：{{ loadError }}</div>
+          <div v-else-if="!isDemo && renderRows.length === 0" class="blank-state">
             <div class="blank-mark">H</div>
             <strong>还没有消息</strong>
             <span>在下面描述你的任务，Hermes 会边执行边把过程写在这里。</span>
           </div>
-
-          <div v-else class="date-divider">今天</div>
+          <template v-else>
+            <div class="date-divider">今天</div>
+            <div v-if="omitted" class="transcript-hint">更早的消息已被内核省略</div>
+          </template>
 
           <!-- 示例数据分支 -->
           <template v-if="isDemo">
@@ -208,22 +268,30 @@ function jumpTo(index: number) {
             </article>
           </template>
 
-          <!-- 真实数据分支 -->
+          <!-- 真实数据分支:历史 + 本轮实时 -->
           <template v-else>
-            <article
-              v-for="(row, i) in items"
-              :key="i"
-              class="message"
-              :class="row.kind === 'user' ? 'user' : row.kind === 'assistant' ? 'assistant' : 'system'"
-            >
-              <div class="message-avatar">{{ row.kind === 'user' ? '你' : row.kind === 'assistant' ? 'H' : '!' }}</div>
+            <article v-for="row in renderRows" :key="row.key" class="message" :class="row.kind">
+              <div class="message-avatar">
+                {{ row.kind === 'user' ? '你' : row.kind === 'assistant' ? 'H' : row.kind === 'tool' ? '⚙' : '!' }}
+              </div>
               <div class="message-body">
                 <div class="message-meta">
                   <span class="message-name">
-                    {{ row.kind === 'user' ? '你' : row.kind === 'assistant' ? 'Hermes' : '系统' }}
+                    {{ row.kind === 'user' ? '你' : row.kind === 'assistant' ? 'Hermes' : row.name || '系统' }}
                   </span>
+                  <!-- 工具行的参数摘要跟在名字后面 -->
+                  <span v-if="row.kind === 'tool' && row.context" class="message-ctx">{{ row.context }}</span>
+                  <span v-if="row.time">{{ row.time }}</span>
                 </div>
-                <div class="message-text">
+                <!-- 工具行:参数是 JSON 字符串,原样显示但限高 -->
+                <div v-if="row.kind === 'tool'" class="message-text tool-args">
+                  {{ row.args || row.context }}
+                </div>
+                <!-- 纯思考行:text 为空,只有推理,否则这行会空白 -->
+                <div v-else-if="!row.text && row.reasoning" class="message-reasoning">
+                  {{ row.reasoning }}
+                </div>
+                <div v-else class="message-text">
                   {{ row.text }}<span v-if="row.streaming" class="caret">▍</span>
                 </div>
               </div>
@@ -705,4 +773,49 @@ function jumpTo(index: number) {
 .mine-empty { margin: 0; padding: 18px 13px; color: var(--muted); font-size: 11.5px; text-align: center; }
 
 .jump-flash :deep(.message-text) { background: var(--accent-soft); }
+
+/* 载入 / 已省略提示:居中一行小字,不占满整个消息区 */
+.transcript-hint {
+  margin: 10px auto;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.transcript-hint.error { color: var(--danger); }
+
+/* 工具行参数摘要:跟在工具名后面,不与名字抢注意力 */
+.message-ctx {
+  max-width: 42%;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 工具行:参数是 JSON 字符串,限高避免长参数把整屏撑开 */
+.message.tool .tool-args {
+  max-height: 132px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--fg-soft);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+/* 纯思考行:压暗、斜体,与正式回复区分 */
+.message-reasoning {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-style: italic;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
 </style>

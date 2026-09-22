@@ -62,6 +62,9 @@ export interface ProjectRow {
 // ── 响应式状态 ────────────────────────────────────────
 
 export const sessions = ref<SessionRow[]>([])
+
+/** 侧栏当前选中的会话(存储 id):对话视图据此拉历史,两处共用一个来源 */
+export const selectedId = ref('')
 export const projects = ref<ProjectRow[]>([])
 export const sessionsLoading = ref(false)
 export const sessionsError = ref('')
@@ -94,6 +97,8 @@ interface WireActiveItem {
 interface WireProjectNode {
   id: string
   label: string
+  /** 项目主目录;label 不像人话时用它兜底命名 */
+  path?: string | null
   color?: string | null
   icon?: string | null
   isAuto?: boolean
@@ -147,6 +152,21 @@ function statusFromLive(live: string | undefined): SessionStatus {
 }
 
 // ── 拉取 ─────────────────────────────────────────────
+
+/**
+ * 后端给的 label 不保证是人话:按文件夹自动识别的项目会把文件夹名直接当 label,
+ * 而 agent 的工作区目录名常常就是一串 UUID,原样显示会变成「ACP · 5ccf5fdb-…」。
+ * 所以显示前洗一遍:label 像 id 就退到 path 的最后一段,path 也像 id 才认输。
+ */
+const ID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-|^[0-9a-f]{20,}$/i
+
+function tidyProjectName(label?: string | null, path?: string | null): string {
+  const l = (label ?? '').trim()
+  if (l && !ID_LIKE.test(l)) return l
+  const base = (path ?? '').replace(/[\/]+$/, '').split(/[\/]/).pop() ?? ''
+  if (base && !ID_LIKE.test(base)) return base
+  return '(未命名项目)'
+}
 
 /** 会话 → 项目 的归属表(sessionId → 项目名),由 projects.* 填充 */
 let projectOf = new Map<string, string>()
@@ -214,7 +234,7 @@ export async function refreshProjects(): Promise<void> {
     const nodes = tree.projects ?? []
     projects.value = nodes.map((n) => ({
       id: n.id,
-      name: n.label || '(未命名项目)',
+      name: tidyProjectName(n.label, n.path),
       color: n.color,
       icon: n.icon,
       sessionCount: n.sessionCount ?? 0,
@@ -227,7 +247,7 @@ export async function refreshProjects(): Promise<void> {
       for (const s of list ?? []) if (s.id) map.set(s.id, label)
     }
 
-    for (const n of nodes) apply(n.label || '(未命名项目)', n.previewSessions)
+    for (const n of nodes) apply(tidyProjectName(n.label, n.path), n.previewSessions)
 
     // 预览条数不够覆盖该项目全部会话时,再补一次完整列表(最多 6 个项目)
     const needFull = nodes.filter((n) => (n.sessionCount ?? 0) > (n.previewSessions?.length ?? 0))
@@ -236,7 +256,7 @@ export async function refreshProjects(): Promise<void> {
         const full = await gateway.request<{
           project?: { previewSessions?: { id?: string }[]; label?: string }
         }>('projects.project_sessions', { project_id: n.id, session_limit: 200 }, 20_000)
-        apply(full.project?.label || n.label || '(未命名项目)', full.project?.previewSessions)
+        apply(tidyProjectName(full.project?.label ?? n.label, n.path), full.project?.previewSessions)
       } catch {
         // 单个项目失败不影响其余归属;这些会话落到「未分类」
       }

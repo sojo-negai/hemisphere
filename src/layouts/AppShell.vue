@@ -13,7 +13,7 @@ import WorkspaceDialog from '../components/WorkspaceDialog.vue'
 import { activeProfile } from '../stores/profiles'
 import {
   archiveSession, branchSession, deleteSession, noteEvent, projects, refreshAll,
-  renameSession, sessions, sessionsError, STATUS_LABEL, type SessionStatus,
+  renameSession, selectedId, sessions, sessionsError, STATUS_LABEL, type SessionStatus,
 } from '../stores/sessions'
 import {
   backendInfo, connected, items, phase, reconnectAttempt, sessionId, subscribeEvents,
@@ -59,9 +59,6 @@ const filters: { key: Filter; label: string }[] = [
   { key: 'project', label: '项目' },
   { key: 'platform', label: '平台' },
 ]
-
-/** 当前选中的会话;真实列表是异步拉取的,初始为空,拉到数据后取第一条 */
-const selectedSession = ref('')
 
 /* ── 搜索:仅匹配标题 ─────────────────────────── */
 const searchOpen = ref(false)
@@ -156,7 +153,7 @@ const grouped = computed(() => {
 })
 
 function pickSession(id: string) {
-  selectedSession.value = id
+  selectedId.value = id
   if (route.path !== '/conversation') void router.push('/conversation')
 }
 
@@ -286,7 +283,7 @@ onMounted(async () => {
   // 事件 → 状态灯(黄=等你确认、红=出错、绿=正常结束)与会话列表刷新
   subscribeEvents((e: GatewayEvent) => noteEvent(e))
   if (connected.value) await refreshAll()
-  if (!selectedSession.value && sessions.value[0]) selectedSession.value = sessions.value[0].id
+  if (!selectedId.value && sessions.value[0]) selectedId.value = sessions.value[0].id
 })
 
 // 内核是在挂载之后才连上的(启动门禁),连上就补拉一次
@@ -494,7 +491,7 @@ watch(connected, (ok) => {
                 v-for="s in group.rows"
                 :key="s.id"
                 class="session"
-                :class="{ selected: s.id === selectedSession }"
+                :class="{ selected: s.id === selectedId }"
                 @click="pickSession(s.id)"
                 @contextmenu.prevent="openSessionMenu($event, s.id)"
               >
